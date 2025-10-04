@@ -536,7 +536,7 @@ class Server {
 				currentThreadInfo = Debugger.getThreadInfo(threadNumber, false);
 				references.clear();
 				stateMutex.release();
-
+				
 				if (currentThreadInfo.status == ThreadInfo.STATUS_STOPPED_BREAK_IMMEDIATE) {
 					sendEvent(Protocol.PauseStop, {threadId: threadNumber});
 				} else if (currentThreadInfo.status == ThreadInfo.STATUS_STOPPED_BREAKPOINT) {
