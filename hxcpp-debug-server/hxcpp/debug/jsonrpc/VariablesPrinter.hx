@@ -97,10 +97,6 @@ class VariablesPrinter {
 		return switch (Type.typeof(value)) {
 			case TNull, TUnknown, TInt, TFloat, TBool, TFunction:
 				Single(Std.string(value));
-			#if (haxe_ver >= 5)
-			case TInt64:
-				Single(Std.string(value));
-			#end
 
 			case TClass(String):
 				Single('"$value"');
@@ -148,6 +144,10 @@ class VariablesPrinter {
 						if (!Reflect.isFunction(propStaticGet(c, value, f)))
 							f
 				], false, propStaticGet.bind(c));
+
+			// Haxe 5's TInt64, not named, since the 5.0.0-preview.1 release doesn't have it.
+			case _:
+				Single(Std.string(value));
 		}
 	}
 
@@ -251,9 +251,6 @@ class VariablesPrinter {
 		return switch (Type.typeof(value)) {
 			case TNull, TUnknown: "Unknown";
 			case TInt: "Int";
-			#if (haxe_ver >= 5)
-			case TInt64: "Int64";
-			#end
 			case TFloat: "Float";
 			case TBool: "Bool";
 			case TFunction: "Function";
@@ -263,6 +260,9 @@ class VariablesPrinter {
 			case TClass(c): getClassName(c);
 			case TObject:
 				Tools.isOfType(value, Class) ? getClassName(cast value) : "Anonymous";
+			// Haxe 5's TInt64 (see resolveValue).
+			case other:
+				Type.enumConstructor(other) == "TInt64" ? "Int64" : "Unknown";
 		}
 	}
 
