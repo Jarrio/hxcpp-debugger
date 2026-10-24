@@ -66,6 +66,7 @@ class Server {
 	var scopes:Map<ScopeId, Array<String>>;
 	var threads:Map<Int, String>;
 	var breakpoints:Map<String, Array<BreakpointInfo>>;
+	var requested:Map<String, SetBreakpointsParams>;
 	var references:References;
 	var started:Bool;
 	var path2file:Map<String, String>;
@@ -95,6 +96,7 @@ class Server {
 		socketMutex = new Mutex();
 		scopes = new Map<ScopeId, Array<String>>();
 		breakpoints = new Map<String, Array<BreakpointInfo>>();
+		requested = new Map<String, SetBreakpointsParams>();
 		references = new References();
 		threads = new Map<Int, String>();
 		path2file = new Map<String, String>();
@@ -192,14 +194,16 @@ class Server {
 		Debugger.enableCurrentThreadDebugging(false);
 		Debugger.breakNow(true);
 
-		var fullPathes = Debugger.getFilesFullPath();
-		var files = Debugger.getFiles();
-		for (i in 0...files.length) {
-			var file = files[i];
-			var path = fullPathes[i];
-			path2file[path2Key(path)] = file;
-			file2path[path2Key(file)] = path;
-		}
+		mapFiles();
+		#if scriptable
+		// Scripts loaded from now on bring files that breakpoints may be waiting for
+		var onLoaded:Dynamic = onScriptLoaded;
+		untyped __cpp__("
+#if defined(HXCPP_DBG_ON_SCRIPT_LOADED) || (HXCPP_API_LEVEL >= 500)
+__hxcpp_dbg_setOnScriptLoadedFunction({0});
+#endif
+", onLoaded);
+		#end
 
 		var classes = Debugger.getClasses();
 		@:privateAccess Interp.globals = new Map<String, Dynamic>();
@@ -252,6 +256,81 @@ class Server {
 		}
 	}
 
+	function mapFiles() {
+		var fullPathes = Debugger.getFilesFullPath();
+		var files = Debugger.getFiles();
+		for (i in 0...files.length) {
+			var file = files[i];
+			var path = fullPathes[i];
+			// A cppia script names its files as Haxe was given them, often relative
+			if (path == file && file != "?" && !haxe.io.Path.isAbsolute(file)) {
+				path = findRequestedPath(file);
+				if (path == null && sys.FileSystem.exists(file))
+					path = sys.FileSystem.fullPath(file);
+				if (path == null)
+					path = file;
+			}
+			path2file[path2Key(path)] = file;
+			file2path[path2Key(file)] = path;
+		}
+	}
+
+	// The breakpoint path, as the editor gave it, whose end is this script file
+	function findRequestedPath(file:String):String {
+		var tail = "/" + path2Key(file).split("\\").join("/");
+		for (params in requested) {
+			var path = path2Key(params.file).split("\\").join("/");
+			if (StringTools.endsWith(path, tail))
+				return params.file;
+		}
+		return null;
+	}
+
+	// Sets the breakpoints asked for in files that only a newly loaded script has
+	function onScriptLoaded() {
+		stateMutex.acquire();
+		mapFiles();
+		for (params in requested) {
+			var current = breakpoints[path2Key(params.file)];
+			if (current == null || Lambda.exists(current, b -> b.id < 0))
+				setBreakpoints(params);
+		}
+		stateMutex.release();
+	}
+
+	// Returns one id per requested breakpoint, in order: -1 for one that couldn't be set, because its
+	// condition doesn't parse or no code from its file is loaded (yet, in a cppia host).
+	function setBreakpoints(params:SetBreakpointsParams):Array<Int> {
+		var key = path2Key(params.file);
+		requested[key] = params;
+		// A script loaded before this request is matched to the path now
+		if (!path2file.exists(key))
+			mapFiles();
+		if (breakpoints.exists(key))
+			for (rm in breakpoints[key])
+				if (rm.id >= 0)
+					Debugger.deleteBreakpoint(rm.id);
+		var file = path2file[key];
+		var result = [];
+		var ids = [];
+		for (b in params.breakpoints) {
+			var bInfo:BreakpointInfo = {id: 0, line: b.line};
+			if (b.condition != null) {
+				try {
+					bInfo.condition = parser.parseString(b.condition);
+				} catch (e:Dynamic) {
+					ids.push(-1);
+					continue;
+				}
+			}
+			bInfo.id = file == null ? -1 : Debugger.addFileLineBreakpoint(file, bInfo.line);
+			result.push(bInfo);
+			ids.push(bInfo.id);
+		}
+		breakpoints[key] = result;
+		return ids;
+	}
+
 	private function readMessage():Message {
 		if (socket == null)
 			return null;
@@ -279,38 +358,9 @@ class Server {
 		switch (m.method) {
 			case Protocol.SetBreakpoints:
 				var params:SetBreakpointsParams = m.params;
-				var key = path2Key(params.file);
-				var file = path2file[key];
-				var result = [];
-				// One id per requested breakpoint, in order; -1 for one that couldn't be set.
-				var ids = [];
-
-				if (breakpoints.exists(key)) {
-					for (rm in breakpoints[key]) {
-						Debugger.deleteBreakpoint(rm.id);
-					}
-				}
-				for (b in params.breakpoints) {
-					// A file that isn't part of the program has nowhere to stop.
-					if (file == null) {
-						ids.push(-1);
-						continue;
-					}
-					var bInfo:BreakpointInfo = {id: 0, line: b.line};
-					if (b.condition != null) {
-						try {
-							var ast:Expr = parser.parseString(b.condition);
-							bInfo.condition = ast;
-						} catch (e:Dynamic) {
-							ids.push(-1);
-							continue;
-						}
-					}
-					bInfo.id = Debugger.addFileLineBreakpoint(file, bInfo.line);
-					result.push(bInfo);
-					ids.push(bInfo.id);
-				}
-				breakpoints[key] = result;
+				stateMutex.acquire();
+				var ids = setBreakpoints(params);
+				stateMutex.release();
 				m.result = ids;
 
 			case Protocol.Pause:
@@ -560,8 +610,8 @@ class Server {
 				} else if (currentThreadInfo.status == ThreadInfo.STATUS_STOPPED_BREAKPOINT) {
 					var bId = currentThreadInfo.breakpoint;
 					var path = file2path[path2Key(fileName)];
-					var thisFileBreakpoints = breakpoints[path2Key(path)];
-					for (b in thisFileBreakpoints) {
+					var thisFileBreakpoints = path == null ? null : breakpoints[path2Key(path)];
+					if (thisFileBreakpoints != null) for (b in thisFileBreakpoints) {
 						if (b.id != bId)
 							continue;
 
