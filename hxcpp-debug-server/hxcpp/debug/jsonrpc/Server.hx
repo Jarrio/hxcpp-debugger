@@ -17,7 +17,7 @@ import hxcpp.debug.jsonrpc.eval.Interp;
 import hxcpp.debug.jsonrpc.eval.Expr;
 import hxcpp.debug.jsonrpc.eval.Interp;
 
-@:enum abstract ScopeId(String) to String {
+enum abstract ScopeId(String) to String {
 	var members = "Members";
 	var locals = "Locals";
 }
@@ -77,13 +77,18 @@ class Server {
 
 	static var startQueue:Deque<Bool> = new Deque<Bool>();
 	@:keep static var inst = {
-		var host:String = Macro.getDefinedValue("HXCPP_DEBUG_HOST", "127.0.0.1");
-		var port:Int = Std.parseInt(Macro.getDefinedValue("HXCPP_DEBUG_PORT", "6972"));
+		// The environment variables let a debugger choose the address each time it starts the program.
+		var host:String = Sys.getEnv("HXCPP_DEBUG_HOST");
+		if (host == null || host == "")
+			host = Macro.getDefinedValue("HXCPP_DEBUG_HOST", "127.0.0.1");
+		var envPort = Sys.getEnv("HXCPP_DEBUG_PORT");
+		var port:Null<Int> = envPort == null ? null : Std.parseInt(envPort);
+		if (port == null)
+			port = Std.parseInt(Macro.getDefinedValue("HXCPP_DEBUG_PORT", "6972"));
 		new Server(host, port);
 	}
 
 	public function new(host:String, port:Int) {
-		trace('Debug Server Started:');
 		this.host = host;
 		this.port = port;
 		stateMutex = new Mutex();
@@ -121,7 +126,6 @@ class Server {
 				throw "Name lookup error.";
 			}
 			socket.connect(host, port);
-			log('Connected to vsc debugger server at $host:$port');
 
 			this.socket = socket;
 			return true;
@@ -146,7 +150,7 @@ class Server {
 	function createListeningSocket() {
 		if (listening == null) {
 			var socket:sys.net.Socket = new sys.net.Socket();
-			socket.bind(new sys.net.Host("localhost"), 6972);
+			socket.bind(new sys.net.Host("localhost"), port);
 			socket.listen(1);
 			listening = socket;
 		}
@@ -275,30 +279,39 @@ class Server {
 		switch (m.method) {
 			case Protocol.SetBreakpoints:
 				var params:SetBreakpointsParams = m.params;
+				var key = path2Key(params.file);
+				var file = path2file[key];
 				var result = [];
+				// One id per requested breakpoint, in order; -1 for one that couldn't be set.
+				var ids = [];
 
-				if (!breakpoints.exists(path2Key(params.file)))
-					breakpoints[path2Key(params.file)] = [];
-
-				for (rm in breakpoints[path2Key(params.file)]) {
-					Debugger.deleteBreakpoint(rm.id);
+				if (breakpoints.exists(key)) {
+					for (rm in breakpoints[key]) {
+						Debugger.deleteBreakpoint(rm.id);
+					}
 				}
 				for (b in params.breakpoints) {
+					// A file that isn't part of the program has nowhere to stop.
+					if (file == null) {
+						ids.push(-1);
+						continue;
+					}
 					var bInfo:BreakpointInfo = {id: 0, line: b.line};
 					if (b.condition != null) {
 						try {
 							var ast:Expr = parser.parseString(b.condition);
 							bInfo.condition = ast;
 						} catch (e:Dynamic) {
-							m.error = {code: ErrorCode.wrongRequest, message: "can't parse condition"};
+							ids.push(-1);
 							continue;
 						}
 					}
-					bInfo.id = Debugger.addFileLineBreakpoint(path2file[path2Key(params.file)], bInfo.line);
+					bInfo.id = Debugger.addFileLineBreakpoint(file, bInfo.line);
 					result.push(bInfo);
+					ids.push(bInfo.id);
 				}
-				breakpoints[path2Key(params.file)] = result;
-				m.result = [for (b in result) b.id];
+				breakpoints[key] = result;
+				m.result = ids;
 
 			case Protocol.Pause:
 				Debugger.breakNow(true);
@@ -438,33 +451,38 @@ class Server {
 					variablesReference: 0
 				};
 				stateMutex.acquire();
-				if (currentThreadInfo != null) {
-					var threadId = currentThreadInfo.number;
-					var frameId = m.params.frameId;
-					var v = VariablesPrinter.evaluate(parser, expr, threadId, frameId);
+				try {
+					if (currentThreadInfo != null) {
+						var threadId = currentThreadInfo.number;
+						var frameId = m.params.frameId;
+						var v = VariablesPrinter.evaluate(parser, expr, threadId, frameId);
 
-					if (v != null) {
-						m.result.type = v.type;
-						switch (v.value) {
-							case NameValueList(names, values):
-								throw "impossible";
+						if (v != null) {
+							m.result.type = v.type;
+							switch (v.value) {
+								case NameValueList(names, values):
+									throw "impossible";
 
-							case IntIndexed(value, length, _):
-								var refId = references.create(v.value);
-								m.result.variablesReference = refId;
-								m.result.indexedVariables = length;
-								m.result.value = Std.string(value);
+								case IntIndexed(value, length, _):
+									var refId = references.create(v.value);
+									m.result.variablesReference = refId;
+									m.result.indexedVariables = length;
+									m.result.value = Std.string(value);
 
-							case StringIndexed(value, printedValue, names, _):
-								var refId = references.create(v.value);
-								m.result.variablesReference = refId;
-								m.result.namedVariables = names.length;
-								m.result.value = printedValue;
+								case StringIndexed(value, printedValue, names, _):
+									var refId = references.create(v.value);
+									m.result.variablesReference = refId;
+									m.result.namedVariables = names.length;
+									m.result.value = printedValue;
 
-							case Single(value):
-								m.result.value = value;
+								case Single(value):
+									m.result.value = value;
+							}
 						}
 					}
+				} catch (e:Dynamic) {
+					stateMutex.release();
+					throw e;
 				}
 				stateMutex.release();
 

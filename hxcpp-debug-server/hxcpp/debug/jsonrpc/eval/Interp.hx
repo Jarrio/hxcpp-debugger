@@ -191,6 +191,7 @@ class Interp {
 		try {
 			return expr(e);
 		} catch (e:Stop) {
+			checkStop(e);
 			switch (e) {
 				case SBreak:
 					throw "Invalid break";
@@ -231,17 +232,23 @@ class Interp {
 		throw e;
 	}
 
+	// hxcpp's `catch (e:Stop)` also catches the values of other enums, such as `Error` (hxcpp 4.3).
+	static inline function checkStop(e:Stop) {
+		if (Type.getEnum(e) != Stop)
+			throw e;
+	}
+
 	function resolve(id:String):Dynamic {
 		var l = locals.get(id);
 		if (l != null)
 			return l.r;
-		var v = variables.get(id);
-		if (v == null && !variables.exists(id)) {
-			v = globals.get(id);
-		} else if (v == null) {
-			error(EUnknownVariable(id));
-		}
-		return v;
+		// A variable can hold null (and `null` itself is one), so ask whether the name exists.
+		if (variables.exists(id))
+			return variables.get(id);
+		if (globals.exists(id))
+			return globals.get(id);
+		error(EUnknownVariable(id));
+		return null;
 	}
 
 	public function expr(e:Expr):Dynamic {
@@ -398,8 +405,8 @@ class Interp {
 							case EBinop("=>", eKey, eValue): {
 									var key:Dynamic = expr(eKey);
 									var value:Dynamic = expr(eValue);
-									isAllString = isAllString && Std.isOfType(key, String);
-									isAllInt = isAllInt && Std.isOfType(key, Int);
+									isAllString = isAllString && Tools.isOfType(key, String);
+									isAllInt = isAllInt && Tools.isOfType(key, Int);
 									isAllObject = isAllObject && Reflect.isObject(key);
 									isAllEnum = isAllEnum && Reflect.isEnumValue(key);
 									keys.push(key);
@@ -455,10 +462,12 @@ class Interp {
 					restore(old);
 					inTry = oldTry;
 					return v;
-				} catch (err:Stop) {
-					inTry = oldTry;
-					throw err;
 				} catch (err:Dynamic) {
+					// Not `catch (err:Stop)`, which in hxcpp also catches the values of other enums (see checkStop).
+					if (Type.getEnum(err) == Stop) {
+						inTry = oldTry;
+						throw err;
+					}
 					// restore vars
 					restore(old);
 					inTry = oldTry;
@@ -507,6 +516,7 @@ class Interp {
 			try {
 				expr(e);
 			} catch (err:Stop) {
+				checkStop(err);
 				switch (err) {
 					case SContinue:
 					case SBreak:
@@ -525,6 +535,7 @@ class Interp {
 			try {
 				expr(e);
 			} catch (err:Stop) {
+				checkStop(err);
 				switch (err) {
 					case SContinue:
 					case SBreak:
@@ -555,6 +566,7 @@ class Interp {
 			try {
 				expr(e);
 			} catch (err:Stop) {
+				checkStop(err);
 				switch (err) {
 					case SContinue:
 					case SBreak:
@@ -568,7 +580,7 @@ class Interp {
 	}
 
 	inline function isMap(o:Dynamic):Bool {
-		return Std.isOfType(o, haxe.Constraints.IMap);
+		return Tools.isOfType(o, haxe.Constraints.IMap);
 	}
 
 	inline function getMapValue(map:Dynamic, key:Dynamic):Dynamic {

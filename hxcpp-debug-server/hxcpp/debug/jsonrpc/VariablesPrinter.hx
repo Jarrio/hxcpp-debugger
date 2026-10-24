@@ -2,6 +2,8 @@ package hxcpp.debug.jsonrpc;
 
 import hxcpp.debug.jsonrpc.eval.Parser;
 import hxcpp.debug.jsonrpc.eval.Interp;
+import hxcpp.debug.jsonrpc.eval.Expr.Error;
+import hxcpp.debug.jsonrpc.eval.Tools;
 
 enum VarType {
 	TypeNull;
@@ -81,6 +83,10 @@ class VariablesPrinter {
 		return switch (Type.typeof(value)) {
 			case TNull, TUnknown, TInt, TFloat, TBool, TFunction:
 				Single(Std.string(value));
+			#if (haxe_ver >= 5)
+			case TInt64:
+				Single(Std.string(value));
+			#end
 
 			case TClass(String):
 				Single('"$value"');
@@ -131,20 +137,38 @@ class VariablesPrinter {
 		}
 	}
 
+	/** Throws a message for the user when `expression` can't be parsed or evaluated. **/
 	public static function evaluate(parser:Parser, expression:String, threadId:Int, frameId:Int):Null<Variable> {
-		var result = null;
+		var interp = initInterp(threadId, frameId, true);
+		var evalRes:Dynamic;
 		try {
-			var interp = initInterp(threadId, frameId, true);
-			var ast = parser.parseString(expression);
-			var evalRes:Dynamic = interp.execute(ast);
-			result = {
-				name: expression,
-				value: resolveValue(evalRes),
-				type: getType(evalRes)
-			};
-		} catch (e:Dynamic) {}
+			evalRes = interp.execute(parser.parseString(expression));
+		} catch (e:Error) {
+			// hxcpp's `catch (e:Error)` also catches the values of other enums (hxcpp 4.3).
+			if (Type.getEnum(e) != Error)
+				throw e;
+			throw errorMessage(e);
+		}
+		return {
+			name: expression,
+			value: resolveValue(evalRes),
+			type: getType(evalRes)
+		};
+	}
 
-		return result;
+	static function errorMessage(error:Error):String {
+		return switch (error) {
+			case EInvalidChar(c): 'Invalid character ${String.fromCharCode(c)}';
+			case EUnexpected(s): 'Unexpected $s';
+			case EUnterminatedString: "Unterminated string";
+			case EUnterminatedComment: "Unterminated comment";
+			case EInvalidPreprocessor(msg): 'Invalid preprocessor directive: $msg';
+			case EUnknownVariable(v): 'Unknown identifier $v';
+			case EInvalidIterator(v): 'Can\'t iterate over $v';
+			case EInvalidOp(op): 'Unsupported operator $op';
+			case EInvalidAccess(f): 'Can\'t access field $f';
+			case ECustom(msg): msg;
+		}
 	}
 
 	public static function initInterp(threadId:Int, frameId:Int, exposeMembers:Bool = false):Interp {
@@ -199,6 +223,9 @@ class VariablesPrinter {
 		return switch (Type.typeof(value)) {
 			case TNull, TUnknown: "Unknown";
 			case TInt: "Int";
+			#if (haxe_ver >= 5)
+			case TInt64: "Int64";
+			#end
 			case TFloat: "Float";
 			case TBool: "Bool";
 			case TFunction: "Function";
@@ -207,10 +234,7 @@ class VariablesPrinter {
 			case TClass(Array): "Array";
 			case TClass(c): getClassName(c);
 			case TObject:
-				if (Std.isOfType(value, Class)) {
-					getClassName(cast value);
-				}
-				"Anonymous";
+				Tools.isOfType(value, Class) ? getClassName(cast value) : "Anonymous";
 		}
 	}
 

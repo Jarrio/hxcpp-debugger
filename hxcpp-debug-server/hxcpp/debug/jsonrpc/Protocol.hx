@@ -18,8 +18,7 @@ typedef Message = {
 	@:optional var error:Error;
 }
 
-@:enum
-abstract ErrorCode(Int) to Int {
+enum abstract ErrorCode(Int) to Int {
 	var internal = 500;
 	var wrongRequest = 422;
 }

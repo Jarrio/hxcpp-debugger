@@ -3,6 +3,11 @@ package hxcpp.debug.jsonrpc.eval;
 import hxcpp.debug.jsonrpc.eval.Expr;
 
 class Tools {
+	/** `Std.isOfType`, which Haxe 4.0 calls `Std.is`. **/
+	public static inline function isOfType(v:Dynamic, t:Dynamic):Bool {
+		return #if (haxe_ver >= 4.1) Std.isOfType(v, t) #else Std.is(v, t) #end;
+	}
+
 	public static function iter(e:Expr, f:Expr->Void) {
 		switch (expr(e)) {
 			case EConst(_), EIdent(_):
