@@ -20,6 +20,8 @@ enum Token {
 	TDoubleDot;
 	TMeta(s:String);
 	TPrepro(s:String);
+	/** A single-quoted string with `$` in it, which Haxe interpolates. **/
+	TInterp(s:String);
 }
 
 class Parser {
@@ -284,6 +286,8 @@ class Parser {
 				return parseExprNext(e);
 			case TConst(c):
 				return parseExprNext(mk(EConst(c)));
+			case TInterp(s):
+				return parseExprNext(interpolate(s));
 			case TPOpen:
 				var e = parseExpr();
 				tk = token();
@@ -564,6 +568,24 @@ class Parser {
 				push(tk);
 				var e = if (tk == TSemicolon) null else parseExpr();
 				mk(EReturn(e), p1, if (e == null) tokenMax else pmax(e));
+			case "cast":
+				var tk = token();
+				if (tk == TPOpen) {
+					var e = parseExpr();
+					var t = null;
+					tk = token();
+					if (tk == TComma) {
+						t = parseType();
+						ensure(TPClose);
+					} else if (tk != TPClose) {
+						unexpected(tk);
+					}
+					mk(ECast(e, t), p1);
+				} else {
+					push(tk);
+					var e = parseExpr();
+					mk(ECast(e, null), p1, pmax(e));
+				}
 			case "new":
 				var a = new Array();
 				a.push(getIdent());
@@ -1387,8 +1409,11 @@ class Parser {
 					return TBkOpen;
 				case "]".code:
 					return TBkClose;
-				case "'".code, '"'.code:
+				case '"'.code:
 					return TConst(CString(readString(char)));
+				case "'".code:
+					var s = readString(char);
+					return s.indexOf("$") >= 0 ? TInterp(s) : TConst(CString(s));
 				case "?".code:
 					return TQuestion;
 				case ":".code:
@@ -1603,9 +1628,63 @@ class Parser {
 		}
 	}
 
+	/** A single-quoted string's `$name` and `${expression}` parts, joined as Haxe joins them. **/
+	function interpolate(s:String):Expr {
+		var parts:Array<Expr> = [];
+		var text = new StringBuf();
+		function flush() {
+			if (text.length > 0) {
+				parts.push(mk(EConst(CString(text.toString()))));
+				text = new StringBuf();
+			}
+		}
+		var identifier = ~/^[A-Za-z_][A-Za-z0-9_]*/;
+		var i = 0;
+		while (i < s.length) {
+			var c = s.charAt(i);
+			var next = i + 1 < s.length ? s.charAt(i + 1) : "";
+			if (c != "$" || next == "") {
+				text.add(c);
+				i++;
+			} else if (next == "$") {
+				text.add("$");
+				i += 2;
+			} else if (next == "{") {
+				var depth = 1;
+				var j = i + 2;
+				while (j < s.length && depth > 0) {
+					var d = s.charAt(j);
+					if (d == "{")
+						depth++;
+					else if (d == "}")
+						depth--;
+					j++;
+				}
+				if (depth > 0)
+					throw EUnterminatedString;
+				flush();
+				parts.push(new Parser().parseString(s.substring(i + 2, j - 1)));
+				i = j;
+			} else if (identifier.match(s.substr(i + 1))) {
+				flush();
+				parts.push(mk(EIdent(identifier.matched(0))));
+				i += 1 + identifier.matched(0).length;
+			} else {
+				text.add(c);
+				i++;
+			}
+		}
+		flush();
+		var e = mk(EConst(CString("")));
+		for (part in parts)
+			e = mk(EBinop("+", e, part));
+		return e;
+	}
+
 	function tokenString(t) {
 		return switch (t) {
 			case TEof: "<eof>";
+			case TInterp(s): "'" + s + "'";
 			case TConst(c): constString(c);
 			case TId(s): s;
 			case TOp(s): s;

@@ -85,6 +85,8 @@ class Tools {
 					for (a in args)
 						f(a);
 				f(e);
+			case ECast(e, _):
+				f(e);
 			case ECheckType(e, _):
 				f(e);
 		}
@@ -122,6 +124,7 @@ class Tools {
 				], def == null ? null : f(def));
 			case EMeta(name, args, e): EMeta(name, args == null ? null : [for (a in args) f(a)], f(e));
 			case ECheckType(e, t): ECheckType(f(e), t);
+			case ECast(e, t): ECast(f(e), t);
 		}
 		return mk(edef, e);
 	}

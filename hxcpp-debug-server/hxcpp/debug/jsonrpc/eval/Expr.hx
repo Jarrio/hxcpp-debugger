@@ -39,6 +39,8 @@ enum Expr {
 	EDoWhile(cond:Expr, e:Expr);
 	EMeta(name:String, args:Array<Expr>, e:Expr);
 	ECheckType(e:Expr, t:CType);
+	/** `cast e`, or with a type, `cast(e, T)`, which checks it. **/
+	ECast(e:Expr, ?t:CType);
 }
 
 typedef Argument = {name:String, ?t:CType, ?opt:Bool, ?value:Expr};

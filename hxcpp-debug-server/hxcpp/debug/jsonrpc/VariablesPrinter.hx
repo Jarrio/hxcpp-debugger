@@ -152,8 +152,8 @@ class VariablesPrinter {
 	}
 
 	/** Throws a message for the user when `expression` can't be parsed or evaluated. **/
-	public static function evaluate(parser:Parser, expression:String, threadId:Int, frameId:Int):Null<Variable> {
-		var evalRes = execute(parser, initInterp(threadId, frameId, true), expression);
+	public static function evaluate(parser:Parser, expression:String, threadId:Int, frameId:Int, ?context:FrameScope.FrameContext):Null<Variable> {
+		var evalRes = execute(parser, initInterp(threadId, frameId, true, context), expression);
 		return {
 			name: expression,
 			value: resolveValue(evalRes),
@@ -193,13 +193,19 @@ class VariablesPrinter {
 		}
 	}
 
-	public static function initInterp(threadId:Int, frameId:Int, exposeMembers:Bool = false):Interp {
+	/** An interpreter for code in a stopped frame: its variables, and the names its code sees (`context`). **/
+	public static function initInterp(threadId:Int, frameId:Int, exposeMembers:Bool = false, ?context:FrameScope.FrameContext):Interp {
 		var stackVariables = cpp.vm.Debugger.getStackVariables(threadId, frameId, false);
 		var interp = new Interp();
+		FrameScope.apply(interp, context);
+		if (context != null)
+			interp.frameClass = Type.resolveClass(context.className);
 		for (vName in stackVariables) {
 			var value = cpp.vm.Debugger.getStackVariableValue(threadId, frameId, vName, false);
 			var klass = Type.getClass(value);
 			interp.variables.set(Type.getClassName(klass), klass);
+			if (vName == "this")
+				interp.thisValue = value;
 			if (exposeMembers) {
 				if (vName == "this") {
 					var members = Reflect.fields(value);

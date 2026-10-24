@@ -1,6 +1,7 @@
 package hxcpp.debug.jsonrpc;
 
 import hxcpp.debug.jsonrpc.VariablesPrinter;
+import hxcpp.debug.jsonrpc.FrameScope;
 import hxcpp.debug.jsonrpc.Protocol;
 #if haxe4
 import sys.thread.Thread;
@@ -16,6 +17,7 @@ import hxcpp.debug.jsonrpc.eval.Parser;
 import hxcpp.debug.jsonrpc.eval.Interp;
 import hxcpp.debug.jsonrpc.eval.Expr;
 import hxcpp.debug.jsonrpc.eval.Interp;
+import hxcpp.debug.jsonrpc.eval.Tools;
 
 enum abstract ScopeId(String) to String {
 	var members = "Members";
@@ -295,6 +297,7 @@ __hxcpp_dbg_setOnScriptLoadedFunction({0});
 		#end
 
 		var classes = Debugger.getClasses();
+		FrameScope.init(classes);
 		@:privateAccess Interp.globals = new Map<String, Dynamic>();
 		// globals declared inside hxcpp library not exposed to classes
 		Interp.globals.set("Math", Math);
@@ -566,7 +569,7 @@ __hxcpp_dbg_setOnScriptLoadedFunction({0});
 					var threadId = thread.info.number;
 					var frameId:Int = m.params.frameId != null ? m.params.frameId : thread.top;
 					// The new value is an expression, evaluated in the frame.
-					var interp = VariablesPrinter.initInterp(threadId, frameId, true);
+					var interp = VariablesPrinter.initInterp(threadId, frameId, true, frameContext(thread, frameId));
 					var value:Dynamic = VariablesPrinter.execute(parser, interp, m.params.value);
 					var result:Dynamic = Debugger.setStackVariableValue(threadId, frameId, m.params.expr, value, false);
 					if (result == Debugger.NONEXISTENT_VALUE)
@@ -582,14 +585,13 @@ __hxcpp_dbg_setOnScriptLoadedFunction({0});
 
 			case Protocol.Completions:
 				stateMutex.acquire();
-				var completions:Array<CompletionItem> = [];
-				var thread = stoppedThread(m.params);
-				if (thread != null) {
-					var frameId:Int = m.params.frameId != null ? m.params.frameId : thread.top;
-					for (variable in Debugger.getStackVariables(thread.info.number, frameId, false))
-						completions.push({label: variable});
+				try {
+					var thread = stoppedThread(m.params);
+					m.result = thread == null ? [] : completions(thread, m.params);
+				} catch (e:Dynamic) {
+					stateMutex.release();
+					throw e;
 				}
-				m.result = completions;
 				stateMutex.release();
 
 			case Protocol.Evaluate:
@@ -600,7 +602,7 @@ __hxcpp_dbg_setOnScriptLoadedFunction({0});
 						throw "The program isn't stopped.";
 					var threadId = thread.info.number;
 					var frameId:Int = m.params.frameId != null ? m.params.frameId : thread.top;
-					var v = VariablesPrinter.evaluate(parser, m.params.expr, threadId, frameId);
+					var v = VariablesPrinter.evaluate(parser, m.params.expr, threadId, frameId, frameContext(thread, frameId));
 					m.result = describe(m.params.expr, v.type, v.value, threadId);
 				} catch (e:Dynamic) {
 					stateMutex.release();
@@ -638,6 +640,60 @@ __hxcpp_dbg_setOnScriptLoadedFunction({0});
 		}
 	}
 
+	/**
+		Names to complete the console's text with, up to the cursor (`column`, from 0): after
+		`expression.`, the value's fields; otherwise every name the frame's code sees.
+	**/
+	function completions(thread:StoppedThread, params:Dynamic):Array<CompletionItem> {
+		var threadId = thread.info.number;
+		var frameId:Int = params.frameId != null ? params.frameId : thread.top;
+		var interp = VariablesPrinter.initInterp(threadId, frameId, true, frameContext(thread, frameId));
+		var text:String = params.text != null ? params.text : "";
+		var before = text.substr(0, params.column != null ? params.column : text.length);
+		var result:Array<CompletionItem> = [];
+		var seen = new Map<String, Bool>();
+		function add(label:String, type:String) {
+			if (!seen.exists(label) && label.indexOf(".") < 0 && label.indexOf(" ") < 0) {
+				seen[label] = true;
+				result.push({label: label, type: type});
+			}
+		}
+		var member = ~/([A-Za-z_][\w.]*)\.\w*$/;
+		if (member.match(before)) {
+			var value:Dynamic = try VariablesPrinter.execute(parser, interp, member.matched(1)) catch (e:Dynamic) null;
+			if (value != null)
+				for (field in fieldNames(value))
+					add(field, "property");
+			return result;
+		}
+		for (name in Debugger.getStackVariables(threadId, frameId, false))
+			add(name, "variable");
+		if (interp.thisValue != null)
+			for (field in fieldNames(interp.thisValue))
+				add(field, "property");
+		if (interp.frameClass != null)
+			for (field in Type.getClassFields(interp.frameClass))
+				add(field, "property");
+		for (name in interp.aliases.keys())
+			add(name, "class");
+		for (name in Interp.globals.keys())
+			add(name, "module");
+		return result;
+	}
+
+	/** The fields of a value: a class's statics, or an object's fields and its class's. **/
+	static function fieldNames(value:Dynamic):Array<String> {
+		if (Tools.isOfType(value, Class))
+			return Type.getClassFields(value);
+		var names = Reflect.fields(value);
+		var type = Type.getClass(value);
+		if (type != null)
+			for (field in Type.getInstanceFields(type))
+				if (names.indexOf(field) < 0)
+					names.push(field);
+		return names;
+	}
+
 	/** A value as the editor shows it. One with fields or items gets a reference to list them by. **/
 	function describe(name:String, type:String, value:Value, threadId:Int):VarInfo {
 		var info:VarInfo = {
@@ -661,6 +717,14 @@ __hxcpp_dbg_setOnScriptLoadedFunction({0});
 				throw "impossible";
 		}
 		return info;
+	}
+
+	/** Where a frame's code is, for the names it sees. **/
+	function frameContext(thread:StoppedThread, frameId:Int):Null<FrameContext> {
+		var frame = thread.info.stack[frameId];
+		if (frame == null)
+			return null;
+		return {className: frame.className, file: file2path[path2Key(frame.fileName)]};
 	}
 
 	/** The stopped thread a request is about: its `threadId`, or the one whose stop was shown last. **/
@@ -771,7 +835,7 @@ __hxcpp_dbg_setOnScriptLoadedFunction({0});
 			return true;
 		var interp:Interp = null;
 		if (b.condition != null || b.logMessage != null)
-			interp = VariablesPrinter.initInterp(thread.info.number, thread.top, true);
+			interp = VariablesPrinter.initInterp(thread.info.number, thread.top, true, frameContext(thread, thread.top));
 		if (b.condition != null && !isConditionPass(interp, b.condition))
 			return false;
 		stateMutex.acquire();

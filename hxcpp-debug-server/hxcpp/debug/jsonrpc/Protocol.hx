@@ -164,14 +164,18 @@ typedef ThreadInfo = {
 typedef AccessExpr = String;
 
 typedef CompletionsArguments = {
+	@:optional var threadId:Int;
 	@:optional var frameId:Int;
 	var text:String;
+	/** The cursor's offset in `text`, from 0. **/
 	var column:Int;
 	@:optional var line:Int;
 }
 
 typedef CompletionItem = {
 	var label:String;
+	/** DAP's item type: `variable`, `property`, `class`, `module`... **/
+	@:optional var type:String;
 	@:optional var text:String;
 	@:optional var start:Int;
 	@:optional var length:Int;

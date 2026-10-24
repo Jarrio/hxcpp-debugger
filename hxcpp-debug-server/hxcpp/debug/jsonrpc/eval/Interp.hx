@@ -13,6 +13,21 @@ class Interp {
 
 	public var variables:Map<String, Dynamic>;
 
+	/** The frame's `this`, whose fields and methods code reaches by name alone. **/
+	public var thisValue:Dynamic;
+
+	/** The frame's class, whose statics code reaches by name alone. **/
+	public var frameClass:Dynamic;
+
+	/** Types the frame's code names without a package: its imports, and its own package's. **/
+	public var aliases:Map<String, Dynamic>;
+
+	/** Classes whose static functions extend values, as `using` makes them. **/
+	public var usings:Array<Dynamic>;
+
+	/** The last place a name is looked for. **/
+	public var fallback:String->Dynamic;
+
 	var locals:Map<String, {r:Dynamic}>;
 	var binops:Map<String, Expr->Expr->Dynamic>;
 	var depth:Int;
@@ -22,6 +37,8 @@ class Interp {
 
 	public function new() {
 		variables = new Map<String, Dynamic>();
+		aliases = new Map<String, Dynamic>();
+		usings = [];
 		locals = new Map();
 		declared = new Array();
 		variables.set("null", null);
@@ -245,8 +262,24 @@ class Interp {
 		// A variable can hold null (and `null` itself is one), so ask whether the name exists.
 		if (variables.exists(id))
 			return variables.get(id);
+		// Then as Haxe looks: the fields of `this`, the class's statics, imports and top-level packages.
+		if (thisValue != null) {
+			var field:Dynamic = Reflect.getProperty(thisValue, id);
+			if (field != null)
+				return field;
+		}
+		if (frameClass != null) {
+			var field:Dynamic = Reflect.getProperty(frameClass, id);
+			if (field != null)
+				return field;
+		}
+		if (aliases.exists(id))
+			return aliases.get(id);
 		if (globals.exists(id))
 			return globals.get(id);
+		var found:Dynamic = fallback == null ? null : fallback(id);
+		if (found != null)
+			return found;
 		error(EUnknownVariable(id));
 		return null;
 	}
@@ -261,6 +294,11 @@ class Interp {
 				}
 			case EIdent(id):
 				return resolve(id);
+			case ECast(e, t):
+				var v = expr(e);
+				if (t != null && v != null && !isOfType(v, t))
+					error(ECustom('Can\'t cast ${Std.string(v)} to that type'));
+				return v;
 			case EVar(n, _, e):
 				declared.push({n: n, old: locals.get(n)});
 				locals.set(n, {r: (e == null) ? null : expr(e)});
@@ -607,7 +645,41 @@ class Interp {
 	}
 
 	function fcall(o:Dynamic, f:String, args:Array<Dynamic>):Dynamic {
-		return call(o, get(o, f), args);
+		var method:Dynamic = get(o, f);
+		if (method == null) {
+			// A static extension, such as StringTools.startsWith for `using StringTools`.
+			for (extension in usings) {
+				var ext:Dynamic = Reflect.field(extension, f);
+				if (ext != null && Reflect.isFunction(ext))
+					return call(extension, ext, [o].concat(args));
+			}
+		}
+		return call(o, method, args);
+	}
+
+	/** Whether `v` is of the type `cast(v, T)` names. **/
+	function isOfType(v:Dynamic, t:CType):Bool {
+		return switch (t) {
+			case CTParent(t): isOfType(v, t);
+			case CTPath(path, _):
+				var name = path.join(".");
+				switch (name) {
+					case "Dynamic": true;
+					case "Int": Tools.isOfType(v, Int);
+					case "Float": Tools.isOfType(v, Float);
+					case "Bool": Tools.isOfType(v, Bool);
+					case "String": Tools.isOfType(v, String);
+					case "Array": Tools.isOfType(v, Array);
+					case _:
+						var type:Dynamic = Type.resolveClass(name);
+						if (type == null)
+							type = Type.resolveEnum(name);
+						if (type == null)
+							type = resolve(name);
+						Tools.isOfType(v, type);
+				}
+			case _: true;
+		}
 	}
 
 	function call(o:Dynamic, f:Dynamic, args:Array<Dynamic>):Dynamic {
