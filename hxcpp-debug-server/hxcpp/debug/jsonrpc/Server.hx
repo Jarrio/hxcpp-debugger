@@ -788,12 +788,12 @@ __hxcpp_dbg_setOnScriptLoadedFunction({0});
 					var stepped = stepping == threadNumber;
 					if (stepped)
 						stepping = null;
-					var wasPausing = pausing;
-					var show = stepped || pausing || reported == null;
+					// Not the halt at startup, which waits for the editor's breakpoints, nor one of the threads
+					// stopped to keep still while another's stop shows.
+					var show = started && (stepped || pausing || reported == null);
 					if (!stepped)
 						pausing = false;
 					stateMutex.release();
-					// Otherwise it's one of the threads stopped to keep still while another's stop shows.
 					if (show)
 						announce(threadNumber, Protocol.PauseStop, {threadId: threadNumber}, stepped ? stopAll : true);
 				} else {
