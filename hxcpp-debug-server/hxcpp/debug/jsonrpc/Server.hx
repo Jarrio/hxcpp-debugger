@@ -189,9 +189,23 @@ class Server {
 			startQueue.pop(true);
 			Debugger.enableCurrentThreadDebugging(true);
 			startQueue.pop(true);
-		} else {
+		} else if (attachWanted()) {
+			log('Waiting for a debugger to attach on port $port');
 			waitForAttach();
 		}
+		// Otherwise the program runs without a debugger.
+	}
+
+	/**
+		Whether to wait for a debugger to attach when none answered at startup: `HXCPP_DEBUG_ATTACH` set in
+		the environment, or defined. Waiting keeps the program from exiting after `main` returns, so a
+		debug build run on its own doesn't wait.
+	**/
+	static function attachWanted():Bool {
+		var value = Sys.getEnv("HXCPP_DEBUG_ATTACH");
+		if (value != null && value != "" && value != "0")
+			return true;
+		return #if HXCPP_DEBUG_ATTACH true #else false #end;
 	}
 
 	private function connect():Bool {
@@ -208,9 +222,7 @@ class Server {
 
 			this.socket = socket;
 			return true;
-		} catch (e:Dynamic) {
-			log('Failed to connect to vsc debugger server at $host:$port');
-		}
+		} catch (e:Dynamic) {}
 		closeSocket();
 		return false;
 	}
