@@ -143,6 +143,9 @@ class Server {
 	/** A pause was asked for and hasn't stopped a thread yet. **/
 	var pausing:Bool;
 
+	/** When, with `stopAll`, the other threads were last told to stop (`Sys.time()`). **/
+	var haltedAt:Float = 0;
+
 	/**
 		When a thread stops, stop the others too (the default), so that nothing changes while the editor
 		shows the stop. Otherwise they go on, and `continue` and the steps only let the stopped one go.
@@ -614,9 +617,15 @@ __hxcpp_dbg_setOnScriptLoadedFunction({0});
 				m.result = [];
 				stateMutex.acquire();
 				var thread = stoppedThread(m.params);
-				if (thread != null) {
-					for (i in 0...thread.top + 1) {
-						var s = thread.info.stack[i];
+				var info:ThreadInfo = thread == null ? null : thread.info;
+				var top = thread == null ? -1 : thread.top;
+				if (info == null && blockedThreadReadable(m.params))
+					info = Debugger.getThreadInfo(m.params.threadId, true);
+				if (info != null && thread == null)
+					top = programTop(info);
+				if (info != null) {
+					for (i in 0...top + 1) {
+						var s = info.stack[i];
 						m.result.unshift({
 							id: i,
 							name: '${s.className}.${s.functionName}',
@@ -727,6 +736,17 @@ __hxcpp_dbg_setOnScriptLoadedFunction({0});
 		return {className: frame.className, file: file2path[path2Key(frame.fileName)]};
 	}
 
+	/**
+		Whether the thread a request names can't stop because it's in native code, such as `Lock.wait()`:
+		with `stopAll`, every thread running Haxe code stops within a line of being told to, so one still
+		running a moment later is in native code, where its Haxe frames hold still and can be read without
+		stopping it. Call with `stateMutex` held.
+	**/
+	function blockedThreadReadable(params:Dynamic):Bool {
+		return stopAll && reported != null && params != null && params.threadId != null && !stopped.exists(params.threadId)
+			&& threads.exists(params.threadId) && Sys.time() - haltedAt > 0.2;
+	}
+
 	/** The stopped thread a request is about: its `threadId`, or the one whose stop was shown last. **/
 	function stoppedThread(params:Dynamic):Null<StoppedThread> {
 		var threadId:Null<Int> = params != null && params.threadId != null ? params.threadId : reported;
@@ -816,6 +836,7 @@ __hxcpp_dbg_setOnScriptLoadedFunction({0});
 		}
 		reported = threadNumber;
 		announced[threadNumber] = true;
+		haltedAt = Sys.time();
 		stateMutex.release();
 		if (stopAll)
 			Debugger.breakNow(false);
