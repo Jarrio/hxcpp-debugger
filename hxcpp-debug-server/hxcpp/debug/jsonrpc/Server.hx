@@ -256,12 +256,21 @@ __hxcpp_dbg_setOnScriptLoadedFunction({0});
 		}
 	}
 
+	// How many files are compiled into the program. A cppia script's files come after them.
+	var compiledFiles = -1;
+
 	function mapFiles() {
 		var fullPathes = Debugger.getFilesFullPath();
 		var files = Debugger.getFiles();
+		// The first call is at startup, before any script is loaded
+		if (compiledFiles < 0)
+			compiledFiles = files.length;
 		for (i in 0...files.length) {
 			var file = files[i];
-			var path = fullPathes[i];
+			// hxcpp adds a script's files to each list unless that list has them already, so after the
+			// compiled files the lists can be out of step: a script's "?" can share its full path with the
+			// program's own. A script names its files the same way in both lists.
+			var path = i < compiledFiles ? fullPathes[i] : file;
 			// A cppia script names its files as Haxe was given them, often relative
 			if (path == file && file != "?" && !haxe.io.Path.isAbsolute(file)) {
 				path = findRequestedPath(file);
