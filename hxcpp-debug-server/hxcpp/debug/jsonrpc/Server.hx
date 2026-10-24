@@ -27,20 +27,53 @@ typedef BreakpointInfo = {
 	var line:Int;
 	@:optional var column:Int;
 	@:optional var condition:Expr;
+	@:optional var hitCondition:HitCondition;
+	@:optional var logMessage:Array<LogPart>;
+	var hits:Int;
 }
 
+/** How many hits a breakpoint takes to stop: the count of hits compared with `count` by `op`. **/
+typedef HitCondition = {
+	var op:String;
+	var count:Int;
+}
+
+/** A piece of a log point's message: text, or an expression whose value goes in its place. **/
+typedef LogPart = {
+	var text:String;
+	@:optional var expr:Expr;
+}
+
+/** A thread waiting in the debugger. **/
+typedef StoppedThread = {
+	var info:ThreadInfo;
+
+	/** Index of the program's innermost frame; the server's own frames are above it. **/
+	var top:Int;
+}
+
+/** A thread's stop the editor hasn't been told about yet, because another thread's is showing. **/
+typedef PendingStop = {
+	var threadId:Int;
+	var method:String;
+	var params:StopParams;
+}
+
+/** Values the editor can list the fields or items of, each kept until its thread goes on. **/
 private class References {
 	static var lastId:Int = 1000;
 
 	var references:Map<Int, Value>;
+	var owners:Map<Int, Int>;
 
 	public function new() {
-		references = new Map<Int, Value>();
+		clear();
 	}
 
-	public function create(ref:Value):Int {
+	public function create(ref:Value, threadId:Int):Int {
 		var id = lastId;
 		references[lastId] = ref;
+		owners[lastId] = threadId;
 		lastId++;
 		return id;
 	}
@@ -49,8 +82,22 @@ private class References {
 		return references[id];
 	}
 
+	/** The thread whose stop the value was read in. **/
+	public function owner(id:Int):Int {
+		return owners[id];
+	}
+
+	/** Forgets the values of a thread that went on. **/
+	public function release(threadId:Int) {
+		for (id in [for (id in owners.keys()) if (owners[id] == threadId) id]) {
+			references.remove(id);
+			owners.remove(id);
+		}
+	}
+
 	public function clear() {
 		references = new Map<Int, Value>();
+		owners = new Map<Int, Int>();
 	}
 }
 
@@ -62,7 +109,6 @@ class Server {
 	var socket:sys.net.Socket;
 	var stateMutex:Mutex;
 	var socketMutex:Mutex;
-	var currentThreadInfo:ThreadInfo;
 	var scopes:Map<ScopeId, Array<String>>;
 	var threads:Map<Int, String>;
 	var breakpoints:Map<String, Array<BreakpointInfo>>;
@@ -72,9 +118,34 @@ class Server {
 	var path2file:Map<String, String>;
 	var file2path:Map<String, String>;
 	var mainThread:Thread;
-	var interp:Interp;
 	var parser:Parser;
 	var isWindows:Bool;
+
+	/** Threads waiting in the debugger, by number. **/
+	var stopped:Map<Int, StoppedThread>;
+
+	/** The thread whose stop the editor was told about last, while it's stopped. **/
+	var reported:Null<Int>;
+
+	/** Threads whose stop the editor was told about, while they're stopped. **/
+	var announced:Map<Int, Bool>;
+
+	/** With `stopAll`, other threads' breakpoint and exception stops, shown one at a time on `continue`. **/
+	var pending:Array<PendingStop>;
+
+	/** The thread being stepped, and how. **/
+	var stepping:Null<Int>;
+
+	var stepType:Int;
+
+	/** A pause was asked for and hasn't stopped a thread yet. **/
+	var pausing:Bool;
+
+	/**
+		When a thread stops, stop the others too (the default), so that nothing changes while the editor
+		shows the stop. Otherwise they go on, and `continue` and the steps only let the stopped one go.
+	**/
+	var stopAll:Bool;
 
 	static var startQueue:Deque<Bool> = new Deque<Bool>();
 	@:keep static var inst = {
@@ -103,6 +174,12 @@ class Server {
 		file2path = new Map<String, String>();
 		mainThread = Thread.current();
 		parser = new Parser();
+		stopped = new Map<Int, StoppedThread>();
+		announced = new Map<Int, Bool>();
+		pending = [];
+		pausing = false;
+		stopAll = true;
+		stepType = 0;
 		started = false;
 		isWindows = Sys.systemName() == "Windows";
 
@@ -178,15 +255,15 @@ class Server {
 		closeSocket();
 		Debugger.setEventNotificationHandler(function(_, _, _, _, _, _, _) {});
 		stateMutex.acquire();
-		if (currentThreadInfo != null) {
-			var threadId:Int = currentThreadInfo.number;
-			currentThreadInfo = null;
-			Debugger.continueThreads(threadId, 1);
+		var wereStopped = stopped.keys().hasNext();
+		clearStops();
+		stateMutex.release();
+		if (wereStopped) {
+			Debugger.continueThreads(-1, 1);
 			mainThread.sendMessage(function() {
 				Debugger.enableCurrentThreadDebugging(false);
 			});
 		}
-		stateMutex.release();
 	}
 
 	private function debuggerThreadMain() {
@@ -323,14 +400,20 @@ __hxcpp_dbg_setOnScriptLoadedFunction({0});
 		var result = [];
 		var ids = [];
 		for (b in params.breakpoints) {
-			var bInfo:BreakpointInfo = {id: 0, line: b.line};
-			if (b.condition != null) {
-				try {
+			var bInfo:BreakpointInfo = {id: 0, line: b.line, hits: 0};
+			try {
+				if (b.condition != null && b.condition != "")
 					bInfo.condition = parser.parseString(b.condition);
-				} catch (e:Dynamic) {
-					ids.push(-1);
-					continue;
+				if (b.hitCondition != null && b.hitCondition != "") {
+					bInfo.hitCondition = parseHitCondition(b.hitCondition);
+					if (bInfo.hitCondition == null)
+						throw 'Not a hit count: ${b.hitCondition}';
 				}
+				if (b.logMessage != null && b.logMessage != "")
+					bInfo.logMessage = parseLogMessage(b.logMessage);
+			} catch (e:Dynamic) {
+				ids.push(-1);
+				continue;
 			}
 			bInfo.id = file == null ? -1 : Debugger.addFileLineBreakpoint(file, bInfo.line);
 			result.push(bInfo);
@@ -365,6 +448,11 @@ __hxcpp_dbg_setOnScriptLoadedFunction({0});
 
 	private function processMessage(m:Message) {
 		switch (m.method) {
+			case Protocol.Configure:
+				if (m.params != null && m.params.stopAllThreads != null)
+					stopAll = m.params.stopAllThreads;
+				m.result = {features: ["threads", "frames", "hitConditions", "logPoints"]};
+
 			case Protocol.SetBreakpoints:
 				var params:SetBreakpointsParams = m.params;
 				stateMutex.acquire();
@@ -373,47 +461,68 @@ __hxcpp_dbg_setOnScriptLoadedFunction({0});
 				m.result = ids;
 
 			case Protocol.Pause:
+				stateMutex.acquire();
+				pausing = true;
+				stateMutex.release();
 				Debugger.breakNow(true);
 
 			case Protocol.Continue:
-				Debugger.continueThreads(m.params.threadId, 1);
 				if (!started) {
+					// The program waits at startup for the editor's breakpoints: everything goes.
+					stateMutex.acquire();
+					clearStops();
+					stateMutex.release();
+					Debugger.continueThreads(-1, 1);
 					started = true;
 					startQueue.push(true);
+				} else if (stopAll) {
+					stateMutex.acquire();
+					var next = pending.shift();
+					if (next == null)
+						clearStops();
+					else
+						reported = next.threadId;
+					stateMutex.release();
+					if (next == null)
+						Debugger.continueThreads(-1, 1);
+					else
+						sendEvent(new NotificationMethod<StopParams>(next.method), next.params);
+				} else {
+					stateMutex.acquire();
+					var threadId:Int = m.params.threadId;
+					// Threads only halted by a pause, which the editor doesn't show as stopped, go with it.
+					var going = [for (n in stopped.keys()) if (n == threadId || !announced.exists(n)) n];
+					stateMutex.release();
+					for (n in going)
+						resumeOnly(n);
 				}
 
 			case Protocol.Threads:
 				stateMutex.acquire();
-				m.result = [
-					for (tid in threads.keys())
-						{id: tid, name: threads[tid]}
-				];
+				var ids = [for (tid in threads.keys()) tid];
+				for (tid in stopped.keys())
+					if (!threads.exists(tid))
+						ids.push(tid);
+				ids.sort((a, b) -> a - b);
+				m.result = [for (tid in ids) {id: tid, name: 'Thread$tid'}];
 				stateMutex.release();
 
 			case Protocol.GetScopes:
 				m.result = [];
-
 				stateMutex.acquire();
-				if (currentThreadInfo != null) {
-					var threadId:Int = currentThreadInfo.number;
+				var thread = stoppedThread(m.params);
+				if (thread != null) {
+					var threadId = thread.info.number;
 					var frameId:Int = m.params.frameId;
-
-					var stackVariables:Array<String> = Debugger.getStackVariables(threadId, frameId, false);
-					var localsId = 0;
-					var localsNames:Array<String> = [];
-					var localsVals:Array<Dynamic> = [];
-					for (varName in stackVariables) {
+					var names:Array<String> = [];
+					for (varName in Debugger.getStackVariables(threadId, frameId, false)) {
 						if (varName == "this") {
 							var value:Dynamic = Debugger.getStackVariableValue(threadId, frameId, "this", false);
-							var id = references.create(VariablesPrinter.resolveValue(value));
-							m.result.push({id: id, name: ScopeId.members});
+							m.result.push({id: references.create(VariablesPrinter.resolveValue(value), threadId), name: ScopeId.members});
 						} else {
-							if (localsId == 0) {
-								localsId = references.create(NameValueList(localsNames, localsVals));
-								m.result.push({id: localsId, name: ScopeId.locals});
-							}
-							localsNames.push(varName);
-							localsVals.push(Debugger.getStackVariableValue(threadId, frameId, varName, false));
+							if (names.length == 0)
+								m.result.push({id: references.create(Locals(threadId, frameId, names), threadId), name: ScopeId.locals});
+							names.push(varName);
 						}
 					}
 				}
@@ -421,43 +530,14 @@ __hxcpp_dbg_setOnScriptLoadedFunction({0});
 
 			case Protocol.GetVariables:
 				m.result = [];
-
 				stateMutex.acquire();
-
 				try {
-					if (currentThreadInfo != null) {
-						var refId = m.params.variablesReference;
-						var value:Value = references.get(refId);
-						var vars = VariablesPrinter.getInnerVariables(value, m.params.start, m.params.count);
-
-						for (v in vars) {
-							var varInfo:VarInfo = {
-								name: v.name,
-								type: v.type,
-								value: "",
-								variablesReference: 0,
-							}
-							switch (v.value) {
-								case NameValueList(names, values):
-									throw "impossible";
-
-								case IntIndexed(value, length, _):
-									var refId = references.create(v.value);
-									varInfo.variablesReference = refId;
-									varInfo.indexedVariables = length;
-									varInfo.value = Std.string(value);
-
-								case StringIndexed(value, printedValue, names, _):
-									var refId = references.create(v.value);
-									varInfo.variablesReference = refId;
-									varInfo.namedVariables = names.length;
-									varInfo.value = printedValue;
-
-								case Single(value):
-									varInfo.value = value;
-							}
-							m.result.push(varInfo);
-						}
+					var refId:Int = m.params.variablesReference;
+					var value:Value = references.get(refId);
+					var threadId = references.owner(refId);
+					if (value != null) {
+						for (v in VariablesPrinter.getInnerVariables(value, m.params.start, m.params.count))
+							m.result.push(describe(v.name, v.type, v.value, threadId));
 					}
 				} catch (e:Dynamic) {
 					stateMutex.release();
@@ -465,80 +545,51 @@ __hxcpp_dbg_setOnScriptLoadedFunction({0});
 				}
 				stateMutex.release();
 
-			case Protocol.SetVariable if (currentThreadInfo != null):
+			case Protocol.SetVariable:
 				stateMutex.acquire();
-				var name = m.params.expr;
-				var value:String = m.params.value;
-				var stringPattern = ~/"(.*?)"/;
-				if (stringPattern.match(value)) {
-					value = stringPattern.matched(1);
+				try {
+					var thread = stoppedThread(m.params);
+					if (thread == null)
+						throw "The program isn't stopped.";
+					var threadId = thread.info.number;
+					var frameId:Int = m.params.frameId != null ? m.params.frameId : thread.top;
+					// The new value is an expression, evaluated in the frame.
+					var interp = VariablesPrinter.initInterp(threadId, frameId, true);
+					var value:Dynamic = VariablesPrinter.execute(parser, interp, m.params.value);
+					var result:Dynamic = Debugger.setStackVariableValue(threadId, frameId, m.params.expr, value, false);
+					if (result == Debugger.NONEXISTENT_VALUE)
+						throw 'There is no local variable ${m.params.expr} here.';
+					if (result == Debugger.THREAD_NOT_STOPPED)
+						throw "The program isn't stopped.";
+					m.result = describe(m.params.expr, VariablesPrinter.getType(result), VariablesPrinter.resolveValue(result), threadId);
+				} catch (e:Dynamic) {
+					stateMutex.release();
+					throw e;
 				}
-				var frameId = currentThreadInfo.stack.length - 3; // top of stack, minus cpp.vm.Debugger and jsonrpc.Server frames
-				var result = Debugger.setStackVariableValue(currentThreadInfo.number, frameId, name, value, false);
-				m.result = {
-					value: switch (VariablesPrinter.resolveValue(result)) {
-						case Single(val): val;
-						case _: Std.string(result);
-					}
-				};
 				stateMutex.release();
 
-			case Protocol.Completions if (currentThreadInfo != null):
+			case Protocol.Completions:
 				stateMutex.acquire();
-				var frameId = getTopFrame();
 				var completions:Array<CompletionItem> = [];
-				var variables = Debugger.getStackVariables(currentThreadInfo.number, frameId, false);
-				for (variable in variables) {
-					completions.push({label: variable});
+				var thread = stoppedThread(m.params);
+				if (thread != null) {
+					var frameId:Int = m.params.frameId != null ? m.params.frameId : thread.top;
+					for (variable in Debugger.getStackVariables(thread.info.number, frameId, false))
+						completions.push({label: variable});
 				}
-				// TODO: this can cause a "critical error in debugger thread" for some reason?
-				/*if (variables.indexOf("this") != -1) {
-					var thisReference = Debugger.getStackVariableValue(currentThreadInfo.number, frameId, "this", false);
-					for (field in Type.getInstanceFields(thisReference)) {
-						completions.push({label: field});
-					}
-				}*/
 				m.result = completions;
 				stateMutex.release();
 
 			case Protocol.Evaluate:
-				var expr = m.params.expr;
-				m.result = {
-					name: expr,
-					value: "",
-					type: "",
-					variablesReference: 0
-				};
 				stateMutex.acquire();
 				try {
-					if (currentThreadInfo != null) {
-						var threadId = currentThreadInfo.number;
-						var frameId = m.params.frameId;
-						var v = VariablesPrinter.evaluate(parser, expr, threadId, frameId);
-
-						if (v != null) {
-							m.result.type = v.type;
-							switch (v.value) {
-								case NameValueList(names, values):
-									throw "impossible";
-
-								case IntIndexed(value, length, _):
-									var refId = references.create(v.value);
-									m.result.variablesReference = refId;
-									m.result.indexedVariables = length;
-									m.result.value = Std.string(value);
-
-								case StringIndexed(value, printedValue, names, _):
-									var refId = references.create(v.value);
-									m.result.variablesReference = refId;
-									m.result.namedVariables = names.length;
-									m.result.value = printedValue;
-
-								case Single(value):
-									m.result.value = value;
-							}
-						}
-					}
+					var thread = stoppedThread(m.params);
+					if (thread == null)
+						throw "The program isn't stopped.";
+					var threadId = thread.info.number;
+					var frameId:Int = m.params.frameId != null ? m.params.frameId : thread.top;
+					var v = VariablesPrinter.evaluate(parser, m.params.expr, threadId, frameId);
+					m.result = describe(m.params.expr, v.type, v.value, threadId);
 				} catch (e:Dynamic) {
 					stateMutex.release();
 					throw e;
@@ -547,16 +598,13 @@ __hxcpp_dbg_setOnScriptLoadedFunction({0});
 
 			case Protocol.StackTrace:
 				m.result = [];
-
 				stateMutex.acquire();
-				if (currentThreadInfo != null) {
-					var i = 0;
-					for (s in currentThreadInfo.stack) {
-						if (s.fileName == "hxcpp/debug/jsonrpc/Server.hx")
-							break;
-
+				var thread = stoppedThread(m.params);
+				if (thread != null) {
+					for (i in 0...thread.top + 1) {
+						var s = thread.info.stack[i];
 						m.result.unshift({
-							id: i++,
+							id: i,
 							name: '${s.className}.${s.functionName}',
 							source: file2path[path2Key(s.fileName)],
 							line: s.lineNumber,
@@ -568,14 +616,56 @@ __hxcpp_dbg_setOnScriptLoadedFunction({0});
 				stateMutex.release();
 
 			case Protocol.Next:
-				Debugger.stepThread(0, Debugger.STEP_OVER, 1);
+				step(m.params, Debugger.STEP_OVER);
 
 			case Protocol.StepIn:
-				Debugger.stepThread(0, Debugger.STEP_INTO, 1);
+				step(m.params, Debugger.STEP_INTO);
 
 			case Protocol.StepOut:
-				Debugger.stepThread(0, Debugger.STEP_OUT, 1);
+				step(m.params, Debugger.STEP_OUT);
 		}
+	}
+
+	/** A value as the editor shows it. One with fields or items gets a reference to list them by. **/
+	function describe(name:String, type:String, value:Value, threadId:Int):VarInfo {
+		var info:VarInfo = {
+			name: name,
+			type: type,
+			value: "",
+			variablesReference: 0
+		};
+		switch (value) {
+			case IntIndexed(v, length, _):
+				info.variablesReference = references.create(value, threadId);
+				info.indexedVariables = length;
+				info.value = Std.string(v);
+			case StringIndexed(_, printedValue, names, _):
+				info.variablesReference = references.create(value, threadId);
+				info.namedVariables = names.length;
+				info.value = printedValue;
+			case Single(v):
+				info.value = v;
+			case NameValueList(_, _) | Locals(_, _, _):
+				throw "impossible";
+		}
+		return info;
+	}
+
+	/** The stopped thread a request is about: its `threadId`, or the one whose stop was shown last. **/
+	function stoppedThread(params:Dynamic):Null<StoppedThread> {
+		var threadId:Null<Int> = params != null && params.threadId != null ? params.threadId : reported;
+		return threadId == null ? null : stopped[threadId];
+	}
+
+	function step(params:Dynamic, type:Int) {
+		stateMutex.acquire();
+		var threadId:Int = params != null && params.threadId != null ? params.threadId : (reported != null ? reported : 0);
+		stepping = threadId;
+		stepType = type;
+		forget(threadId);
+		stateMutex.release();
+		// Only this thread runs; with `stopAll`, the others stay stopped.
+		Debugger.stepThread(threadId, type, 1);
 	}
 
 	private function sendEvent<T>(event:NotificationMethod<T>, ?params:T) {
@@ -587,72 +677,228 @@ __hxcpp_dbg_setOnScriptLoadedFunction({0});
 	}
 
 	function handleThreadEvent(threadNumber:Int, event:Int, stackFrame:Int, className:String, functionName:String, fileName:String, lineNumber:Int) {
-		// if (!started) return;
-
 		switch (event) {
 			case Debugger.THREAD_TERMINATED:
 				stateMutex.acquire();
 				threads.remove(threadNumber);
-				if (currentThreadInfo != null && threadNumber == currentThreadInfo.number) {
-					currentThreadInfo = null;
-				}
+				forget(threadNumber);
 				stateMutex.release();
 				sendEvent(Protocol.ThreadExit, {threadId: threadNumber});
 
 			case Debugger.THREAD_CREATED | Debugger.THREAD_STARTED:
+				// hxcpp starts each thread unable to stop. This runs on the new thread, which can enable itself.
+				if (event == Debugger.THREAD_CREATED)
+					Debugger.enableCurrentThreadDebugging(true);
 				stateMutex.acquire();
 				threads.set(threadNumber, 'Thread${threadNumber}');
-				if (currentThreadInfo != null && threadNumber == currentThreadInfo.number) {
-					currentThreadInfo = null;
-				}
+				// THREAD_STARTED also comes each time a stopped thread goes on.
+				forget(threadNumber);
 				stateMutex.release();
 				sendEvent(Protocol.ThreadStart, {threadId: threadNumber});
 
 			case Debugger.THREAD_STOPPED:
+				var info = Debugger.getThreadInfo(threadNumber, false);
+				var thread:StoppedThread = {info: info, top: programTop(info)};
 				stateMutex.acquire();
-				currentThreadInfo = Debugger.getThreadInfo(threadNumber, false);
-				references.clear();
+				stopped[threadNumber] = thread;
 				stateMutex.release();
-				
-				if (currentThreadInfo.status == ThreadInfo.STATUS_STOPPED_BREAK_IMMEDIATE) {
-					sendEvent(Protocol.PauseStop, {threadId: threadNumber});
-				} else if (currentThreadInfo.status == ThreadInfo.STATUS_STOPPED_BREAKPOINT) {
-					var bId = currentThreadInfo.breakpoint;
-					var path = file2path[path2Key(fileName)];
-					var thisFileBreakpoints = path == null ? null : breakpoints[path2Key(path)];
-					if (thisFileBreakpoints != null) for (b in thisFileBreakpoints) {
-						if (b.id != bId)
-							continue;
-
-						interp = VariablesPrinter.initInterp(threadNumber, getTopFrame(), true);
-						if (b.condition != null) {
-							if (!isConditionPass(b.condition)) {
-								Debugger.continueThreads(threadNumber, 1);
-								return;
-							}
-						}
-					}
-					sendEvent(Protocol.BreakpointStop, {threadId: threadNumber});
+				if (info.status == ThreadInfo.STATUS_STOPPED_BREAKPOINT) {
+					if (breaksHere(thread))
+						announce(threadNumber, Protocol.BreakpointStop, {threadId: threadNumber}, stopAll);
+					else
+						goOn(threadNumber);
+				} else if (info.status == ThreadInfo.STATUS_STOPPED_BREAK_IMMEDIATE) {
+					stateMutex.acquire();
+					var stepped = stepping == threadNumber;
+					if (stepped)
+						stepping = null;
+					var wasPausing = pausing;
+					var show = stepped || pausing || reported == null;
+					if (!stepped)
+						pausing = false;
+					stateMutex.release();
+					// Otherwise it's one of the threads stopped to keep still while another's stop shows.
+					if (show)
+						announce(threadNumber, Protocol.PauseStop, {threadId: threadNumber}, stepped ? stopAll : true);
 				} else {
-					sendEvent(Protocol.ExceptionStop, {text: currentThreadInfo.criticalErrorDescription});
+					announce(threadNumber, Protocol.ExceptionStop, {threadId: threadNumber, text: info.criticalErrorDescription}, stopAll);
 				}
-				// ThreadStopped(threadNumber, stackFrame, className,
-				//                functionName, fileName, lineNumber));
 		}
 	}
 
-	function isConditionPass(condition:Expr):Bool {
+	/**
+		Tells the editor a thread stopped, and with `stopAll`, stops the others. While another thread's
+		stop shows, with `stopAll`, the stop waits its turn instead (`continue` shows it).
+	**/
+	function announce(threadNumber:Int, method:NotificationMethod<StopParams>, params:StopParams, allThreadsStopped:Bool) {
+		stateMutex.acquire();
+		if (stopAll && reported != null && reported != threadNumber) {
+			params.allThreadsStopped = true;
+			pending.push({threadId: threadNumber, method: method, params: params});
+			stateMutex.release();
+			return;
+		}
+		reported = threadNumber;
+		announced[threadNumber] = true;
+		stateMutex.release();
+		if (stopAll)
+			Debugger.breakNow(false);
+		params.allThreadsStopped = allThreadsStopped;
+		sendEvent(method, params);
+	}
+
+	/**
+		Whether a thread at a breakpoint stops there: its condition holds, its hit count is reached, and
+		it isn't a log point, which prints its message instead.
+	**/
+	function breaksHere(thread:StoppedThread):Bool {
+		stateMutex.acquire();
+		var b = findBreakpoint(thread.info.breakpoint);
+		stateMutex.release();
+		if (b == null)
+			return true;
+		var interp:Interp = null;
+		if (b.condition != null || b.logMessage != null)
+			interp = VariablesPrinter.initInterp(thread.info.number, thread.top, true);
+		if (b.condition != null && !isConditionPass(interp, b.condition))
+			return false;
+		stateMutex.acquire();
+		var hits = ++b.hits;
+		stateMutex.release();
+		if (b.hitCondition != null && !hitReached(b.hitCondition, hits))
+			return false;
+		if (b.logMessage != null) {
+			sendEvent(Protocol.Output, {text: logLine(interp, b.logMessage) + "\n", threadId: thread.info.number});
+			return false;
+		}
+		return true;
+	}
+
+	/** After a breakpoint that doesn't stop: the thread goes on, unless everything is being held still. **/
+	function goOn(threadNumber:Int) {
+		stateMutex.acquire();
+		var held = stopAll && reported != null;
+		stateMutex.release();
+		if (!held)
+			resumeOnly(threadNumber);
+	}
+
+	/** Lets one thread go on and leaves the others as they are. **/
+	function resumeOnly(threadNumber:Int) {
+		stateMutex.acquire();
+		forget(threadNumber);
+		var step = stepping != threadNumber ? stepping : null;
+		var type = stepType;
+		stateMutex.release();
+		// hxcpp only lets a single thread go through a step, here one that never stops (STEP_NONE)...
+		Debugger.stepThread(threadNumber, 0, 1);
+		// ...which replaces a step in progress on another thread, so that one is set again.
+		if (step != null)
+			Debugger.stepThread(step, type, 1);
+	}
+
+	/** Forgets that a thread is stopped (it went on, or ended). Call with `stateMutex` held. **/
+	function forget(threadNumber:Int) {
+		stopped.remove(threadNumber);
+		announced.remove(threadNumber);
+		references.release(threadNumber);
+		if (reported == threadNumber)
+			reported = null;
+	}
+
+	/** Forgets every stop, as everything goes on. Call with `stateMutex` held. **/
+	function clearStops() {
+		stopped = new Map<Int, StoppedThread>();
+		announced = new Map<Int, Bool>();
+		pending = [];
+		reported = null;
+		stepping = null;
+		references.clear();
+	}
+
+	function findBreakpoint(id:Int):Null<BreakpointInfo> {
+		for (list in breakpoints)
+			for (b in list)
+				if (b.id == id)
+					return b;
+		return null;
+	}
+
+	function isConditionPass(interp:Interp, condition:Expr):Bool {
 		try {
-			var evalRes:Bool = interp.execute(condition);
-			return evalRes;
+			return interp.execute(condition) == true;
 		} catch (e:Dynamic) {}
 
 		return false;
 	}
 
-	function getTopFrame():Int {
-		// top of stack, minus cpp.vm.Debugger and jsonrpc.Server frames
-		return (currentThreadInfo != null) ? currentThreadInfo.stack.length - 3 : -1;
+	static function parseHitCondition(text:String):Null<HitCondition> {
+		// Not a static: the server starts while the class's statics are still being set up.
+		var hitPattern = ~/^\s*(>=|<=|==|=|>|<|%|)\s*([0-9]+)\s*$/;
+		if (!hitPattern.match(text))
+			return null;
+		var op = hitPattern.matched(1);
+		return {op: op == "" ? ">=" : op, count: Std.parseInt(hitPattern.matched(2))};
+	}
+
+	static function hitReached(condition:HitCondition, hits:Int):Bool {
+		return switch (condition.op) {
+			case "==" | "=": hits == condition.count;
+			case ">": hits > condition.count;
+			case "<": hits < condition.count;
+			case "<=": hits <= condition.count;
+			case "%": condition.count > 0 && hits % condition.count == 0;
+			case _: hits >= condition.count;
+		}
+	}
+
+	/** A log message split at each `{expression}`, parsed once rather than at every hit. **/
+	function parseLogMessage(message:String):Array<LogPart> {
+		var parts:Array<LogPart> = [];
+		var placeholder = ~/\{([^{}]*)\}/;
+		var rest = message;
+		while (placeholder.match(rest)) {
+			if (placeholder.matchedLeft() != "")
+				parts.push({text: placeholder.matchedLeft()});
+			var source = placeholder.matched(1);
+			try {
+				parts.push({text: source, expr: parser.parseString(source)});
+			} catch (e:Dynamic) {
+				parts.push({text: '{$source}'});
+			}
+			rest = placeholder.matchedRight();
+		}
+		if (rest != "")
+			parts.push({text: rest});
+		return parts;
+	}
+
+	function logLine(interp:Interp, parts:Array<LogPart>):String {
+		var line = new StringBuf();
+		for (part in parts) {
+			if (part.expr == null) {
+				line.add(part.text);
+				continue;
+			}
+			try {
+				line.add(Std.string(interp.execute(part.expr)));
+			} catch (e:Dynamic) {
+				line.add('{${part.text}: ${VariablesPrinter.describeError(e)}}');
+			}
+		}
+		return line.toString();
+	}
+
+	/** Index of the innermost frame of the program's own: the stack's top holds the server's frames. **/
+	static function programTop(info:ThreadInfo):Int {
+		var i = info.stack.length - 1;
+		while (i >= 0 && isServerFrame(info.stack[i]))
+			i--;
+		return i;
+	}
+
+	static function isServerFrame(frame:StackFrame):Bool {
+		return frame.className == "cpp.vm.Debugger" || StringTools.startsWith(frame.className, "hxcpp.debug.jsonrpc.");
 	}
 
 	function closeSocket() {

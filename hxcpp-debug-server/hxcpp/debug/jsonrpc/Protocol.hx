@@ -28,37 +28,62 @@ typedef Error = {
 	var message:String;
 }
 
+/**
+	Requests about a stopped thread take its `threadId`; without one, they're about the thread whose stop
+	the editor was told about last.
+**/
 @:publicFields
 class Protocol {
+	/** Sets the session's options; the result lists what this server can do (older servers answer null). **/
+	static inline var Configure = new RequestMethod<{?stopAllThreads:Bool}, {features:Array<String>}>("configure");
 	static inline var Pause = new RequestMethod<{}, Void>("pause");
 	static inline var Continue = new RequestMethod<{threadId:Int}, Void>("continue");
-	static inline var StepIn = new RequestMethod<{}, Void>("stepIn");
-	static inline var Next = new RequestMethod<{}, Void>("next");
-	static inline var StepOut = new RequestMethod<{}, Void>("stepOut");
+	static inline var StepIn = new RequestMethod<{?threadId:Int}, Void>("stepIn");
+	static inline var Next = new RequestMethod<{?threadId:Int}, Void>("next");
+	static inline var StepOut = new RequestMethod<{?threadId:Int}, Void>("stepOut");
 	static inline var StackTrace = new RequestMethod<{threadId:Int}, Array<StackFrameInfo>>("stackTrace");
 	static inline var SetBreakpoints = new RequestMethod<SetBreakpointsParams, Array<{id:Int}>>("setBreakpoints");
 	static inline var SetBreakpoint = new RequestMethod<SetBreakpointParams, {id:Int}>("setBreakpoint");
 	static inline var RemoveBreakpoint = new RequestMethod<{id:Int}, Void>("removeBreakpoint");
 	static inline var SwitchFrame = new RequestMethod<{id:Int}, Void>("switchFrame");
-	static inline var GetScopes = new RequestMethod<{frameId:Int}, Array<ScopeInfo>>("getScopes");
+	static inline var GetScopes = new RequestMethod<{?threadId:Int, frameId:Int}, Array<ScopeInfo>>("getScopes");
 	static inline var GetVariables = new RequestMethod<{variablesReference:Int, ?start:Int, ?count:Int}, Array<VarInfo>>("getVariables");
 	// static inline var GetScopeVariables = new RequestMethod<{},Array<VarInfo>>("getScopeVariables");
 	// static inline var GetStructure = new RequestMethod<{},Array<VarInfo>>("getStructure");
-	static inline var SetVariable = new RequestMethod<{expr:String, value:String}, VarInfo>("setVariable");
+	/** Sets a local variable of a frame (the innermost without one) to the value of the expression `value`. **/
+	static inline var SetVariable = new RequestMethod<{?threadId:Int, ?frameId:Int, expr:String, value:String}, VarInfo>("setVariable");
 	static inline var Threads = new RequestMethod<{}, Array<ThreadInfo>>("threads");
-	static inline var Evaluate = new RequestMethod<{expr:String, frameId:Int}, VarInfo>("evaluate");
+	static inline var Evaluate = new RequestMethod<{?threadId:Int, expr:String, frameId:Int}, VarInfo>("evaluate");
 	static inline var Completions = new RequestMethod<CompletionsArguments, Array<CompletionItem>>("completions");
 	static inline var SetExceptionOptions = new RequestMethod<Array<String>, Void>("setExceptionOptions");
-	static inline var BreakpointStop = new NotificationMethod<{threadId:Int}>("breakpointStop");
-	static inline var ExceptionStop = new NotificationMethod<{text:String}>("exceptionStop");
-	static inline var PauseStop = new NotificationMethod<{threadId:Int}>("pauseStop");
+	static inline var BreakpointStop = new NotificationMethod<StopParams>("breakpointStop");
+	static inline var ExceptionStop = new NotificationMethod<StopParams>("exceptionStop");
+	static inline var PauseStop = new NotificationMethod<StopParams>("pauseStop");
+	/** A log point's message. **/
+	static inline var Output = new NotificationMethod<{text:String, threadId:Int}>("output");
 	static inline var ThreadStart = new NotificationMethod<{threadId:Int}>("threadStart");
 	static inline var ThreadExit = new NotificationMethod<{threadId:Int}>("ThreadExit");
 }
 
+typedef StopParams = {
+	var threadId:Int;
+
+	/** Whether the other threads stopped too. **/
+	@:optional var allThreadsStopped:Bool;
+
+	/** An exception's description. **/
+	@:optional var text:String;
+}
+
 typedef SetBreakpointsParams = {
 	var file:String;
-	var breakpoints:Array<{line:Int, ?column:Int, ?condition:String}>;
+
+	/**
+		`hitCondition` is a count of hits, after an optional operator (`>=` without one, `==`, `>`, `<`,
+		`<=`, or `%` for every n-th). A `logMessage` makes it a log point: it prints the message, with each
+		`{expression}` in it evaluated, instead of stopping.
+	**/
+	var breakpoints:Array<{line:Int, ?column:Int, ?condition:String, ?hitCondition:String, ?logMessage:String}>;
 }
 
 typedef SetBreakpointParams = {

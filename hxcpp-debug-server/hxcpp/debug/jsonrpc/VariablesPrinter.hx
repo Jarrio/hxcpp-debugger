@@ -21,6 +21,8 @@ enum Value {
 	IntIndexed(val:Dynamic, length:Int, fieldAccess:Dynamic->Int->Dynamic);
 	StringIndexed(val:Dynamic, printedValue:String, names:Array<String>, fieldsAsString:Bool, fieldAccess:Dynamic->String->Dynamic);
 	NameValueList(names:Array<String>, values:Array<Dynamic>);
+	/** A stopped frame's local variables, read when asked for, so that a changed one shows its new value. **/
+	Locals(threadId:Int, frameId:Int, names:Array<String>);
 }
 
 typedef Variable = {
@@ -43,6 +45,18 @@ class VariablesPrinter {
 						continue;
 					result.push({
 						name: name,
+						value: resolveValue(value),
+						type: getType(value)
+					});
+				}
+
+			case Locals(threadId, frameId, names):
+				if (count < 0)
+					count = names.length - start;
+				for (i in start...start + count) {
+					var value:Dynamic = cpp.vm.Debugger.getStackVariableValue(threadId, frameId, names[i], false);
+					result.push({
+						name: names[i],
 						value: resolveValue(value),
 						type: getType(value)
 					});
@@ -139,21 +153,29 @@ class VariablesPrinter {
 
 	/** Throws a message for the user when `expression` can't be parsed or evaluated. **/
 	public static function evaluate(parser:Parser, expression:String, threadId:Int, frameId:Int):Null<Variable> {
-		var interp = initInterp(threadId, frameId, true);
-		var evalRes:Dynamic;
+		var evalRes = execute(parser, initInterp(threadId, frameId, true), expression);
+		return {
+			name: expression,
+			value: resolveValue(evalRes),
+			type: getType(evalRes)
+		};
+	}
+
+	/** The value of `expression` in `interp`. Throws a message for the user when it can't be parsed or evaluated. **/
+	public static function execute(parser:Parser, interp:Interp, expression:String):Dynamic {
 		try {
-			evalRes = interp.execute(parser.parseString(expression));
+			return interp.execute(parser.parseString(expression));
 		} catch (e:Error) {
 			// hxcpp's `catch (e:Error)` also catches the values of other enums (hxcpp 4.3).
 			if (Type.getEnum(e) != Error)
 				throw e;
 			throw errorMessage(e);
 		}
-		return {
-			name: expression,
-			value: resolveValue(evalRes),
-			type: getType(evalRes)
-		};
+	}
+
+	/** A message for a value the evaluator threw. **/
+	public static function describeError(error:Dynamic):String {
+		return Type.getEnum(error) == Error ? errorMessage(error) : Std.string(error);
 	}
 
 	static function errorMessage(error:Error):String {
